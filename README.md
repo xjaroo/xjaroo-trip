@@ -10,7 +10,15 @@ You need a Rust toolchain with Cargo. Run:
 ./run.sh
 ```
 
-`run.sh` checks the configured TCP port first, stops any process already listening there, then starts the planner. It uses `lsof` to find the listener and waits for a graceful shutdown before forcing it to stop if needed.
+`run.sh` builds and starts the planner in the background. It checks the configured TCP port first and stops any process already listening there. The PID file and log are stored at `data/xjaroo-trip.pid` and `data/xjaroo-trip.log`.
+
+Manage the background app with:
+
+```sh
+./run.sh status
+./run.sh restart
+./run.sh stop
+```
 
 Open the printed address and create a trip. Add stops with date ranges, then add optional daily activities inside each stop. The trip form records the travelers, their home base, and a contact back home. The dashboard highlights the stop covering today's date. **Family link** is for viewing and comments. **Traveler edit link** also allows changing the plan, costs, and photos; share it only with travelers. Both links use unguessable UUIDs. Use **Copy trip** to start a fresh plan from stops and costs. Photos are resized in the browser to a maximum 1400 px edge and JPEG compressed before they are saved locally. **Save HTML** downloads a snapshot and **Save PDF** opens the browser print dialog.
 

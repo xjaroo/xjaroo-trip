@@ -663,7 +663,8 @@ async fn search_places(
 async fn map_config() -> Json<Value> {
     Json(json!({
         "style_url": env::var("MAP_STYLE_URL")
-            .unwrap_or_else(|_| "https://tiles.openfreemap.org/styles/liberty".into())
+            .unwrap_or_else(|_| "https://tiles.openfreemap.org/styles/liberty".into()),
+        "public_url": env::var("TRIP_PUBLIC_URL").unwrap_or_default().trim_end_matches('/'),
     }))
 }
 
@@ -709,7 +710,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nest_service("/static", ServeDir::new("static"))
         .nest_service("/photos", ServeDir::new(photo_path))
         .with_state(state);
-    let address = env::var("TRIP_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".into());
+    let address = env::var("TRIP_ADDR").unwrap_or_else(|_| "127.0.0.1:3007".into());
     let listener = tokio::net::TcpListener::bind(&address).await?;
     println!("Trip planner ready at http://{address}");
     axum::serve(listener, app).await?;

@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")"
+if [[ -f .env ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source .env
+  set +a
+fi
 export TRIP_DB="${TRIP_DB:-$PWD/data/trips.sqlite}"
-export TRIP_ADDR="${TRIP_ADDR:-127.0.0.1:3000}"
+export TRIP_ADDR="${TRIP_ADDR:-127.0.0.1:3007}"
 
 port="${TRIP_ADDR##*:}"
 if [[ ! "$port" =~ ^[0-9]+$ ]]; then

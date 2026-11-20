@@ -1,3 +1,7 @@
+use argon2::{
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
+};
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
@@ -11,6 +15,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
     env,
     path::PathBuf,
     sync::Arc,
@@ -25,7 +30,41 @@ struct AppState {
     photo_path: Arc<PathBuf>,
     geocoder_last_request: Arc<tokio::sync::Mutex<Option<Instant>>>,
     geocoder_url: Arc<String>,
-    geocoder_client: Arc<reqwest::blocking::Client>,
+    geocoder_client: Arc<reqwest::Client>,
+    pin_attempts: Arc<tokio::sync::Mutex<PinAttempts>>,
+}
+
+#[derive(Default)]
+struct PinAttempts {
+    failures: HashMap<String, Vec<Instant>>,
+}
+
+impl PinAttempts {
+    fn blocked(&mut self, keys: &[String], now: Instant) -> bool {
+        self.prune(now);
+        keys.iter()
+            .any(|key| self.failures.get(key).is_some_and(|times| times.len() >= 5))
+    }
+
+    fn fail(&mut self, keys: &[String], now: Instant) {
+        self.prune(now);
+        for key in keys {
+            self.failures.entry(key.clone()).or_default().push(now);
+        }
+    }
+
+    fn clear(&mut self, keys: &[String]) {
+        for key in keys {
+            self.failures.remove(key);
+        }
+    }
+
+    fn prune(&mut self, now: Instant) {
+        self.failures.retain(|_, times| {
+            times.retain(|at| now.duration_since(*at) < Duration::from_secs(15 * 60));
+            !times.is_empty()
+        });
+    }
 }
 
 #[derive(Debug)]
@@ -67,6 +106,47 @@ fn now() -> String {
     Utc::now().to_rfc3339()
 }
 
+fn valid_pin(pin: &str) -> bool {
+    pin.len() == 4 && pin.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn hash_pin(pin: &str) -> ApiResult<String> {
+    let salt = SaltString::encode_b64(Uuid::new_v4().as_bytes()).map_err(internal)?;
+    Argon2::default()
+        .hash_password(pin.as_bytes(), &salt)
+        .map(|hash| hash.to_string())
+        .map_err(internal)
+}
+
+fn verify_pin(pin: &str, encoded_hash: &str) -> bool {
+    PasswordHash::new(encoded_hash).ok().is_some_and(|hash| {
+        Argon2::default()
+            .verify_password(pin.as_bytes(), &hash)
+            .is_ok()
+    })
+}
+
+fn valid_share_mode(mode: &str) -> bool {
+    matches!(mode, "private" | "pin" | "public")
+}
+
+fn pin_attempt_keys(trip_id: &str, headers: &HeaderMap) -> Vec<String> {
+    let ip = headers
+        .get("cf-connecting-ip")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown");
+    let user_agent = headers
+        .get("user-agent")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("unknown");
+    vec![
+        format!("trip:{trip_id}:ip:{ip}"),
+        format!("trip:{trip_id}:browser:{ip}:{user_agent}"),
+    ]
+}
+
 async fn require_editor(state: &AppState, id: &str, headers: &HeaderMap) -> ApiResult<()> {
     let supplied = headers
         .get("x-edit-key")
@@ -104,6 +184,7 @@ fn init_db(path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         id TEXT PRIMARY KEY, title TEXT NOT NULL, start_date TEXT NOT NULL, end_date TEXT NOT NULL,
         travelers INTEGER NOT NULL DEFAULT 1, currency TEXT NOT NULL DEFAULT 'AUD',
         origin TEXT NOT NULL DEFAULT '', traveler_names TEXT NOT NULL DEFAULT '', emergency_name TEXT NOT NULL DEFAULT '', emergency_phone TEXT NOT NULL DEFAULT '', edit_key TEXT NOT NULL DEFAULT '',
+        share_mode TEXT NOT NULL DEFAULT 'private', pin_hash TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS itinerary_items (
@@ -137,6 +218,13 @@ fn init_db(path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         "TEXT NOT NULL DEFAULT ''",
     )?;
     ensure_column(&conn, "trips", "edit_key", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(
+        &conn,
+        "trips",
+        "share_mode",
+        "TEXT NOT NULL DEFAULT 'private'",
+    )?;
+    ensure_column(&conn, "trips", "pin_hash", "TEXT NOT NULL DEFAULT ''")?;
     ensure_column(&conn, "itinerary_items", "end_day", "TEXT")?;
     ensure_column(&conn, "itinerary_items", "parent_id", "INTEGER")?;
     ensure_column(
@@ -183,6 +271,8 @@ struct NewTrip {
     traveler_names: Option<String>,
     emergency_name: Option<String>,
     emergency_phone: Option<String>,
+    share_mode: Option<String>,
+    pin: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -196,6 +286,8 @@ struct UpdateTrip {
     traveler_names: Option<String>,
     emergency_name: Option<String>,
     emergency_phone: Option<String>,
+    share_mode: Option<String>,
+    pin: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -251,6 +343,7 @@ struct TripData {
     comments: Vec<Value>,
     expenses: Vec<Value>,
     photos: Vec<Value>,
+    access: String,
 }
 
 #[derive(Deserialize)]
@@ -288,6 +381,18 @@ async fn create_trip(
     if input.end_date < input.start_date {
         return Err(bad("End date must be on or after the start date"));
     }
+    let share_mode = input.share_mode.unwrap_or_else(|| "private".into());
+    if !valid_share_mode(&share_mode) {
+        return Err(bad("Sharing must be private, PIN protected, or public"));
+    }
+    let pin_hash = match (share_mode.as_str(), input.pin.as_deref()) {
+        ("pin", Some(pin)) if valid_pin(pin) => hash_pin(pin)?,
+        ("pin", _) => return Err(bad("Set a four-digit PIN for PIN-protected sharing")),
+        (_, Some(pin)) if !pin.is_empty() => {
+            return Err(bad("A PIN is only used with PIN-protected sharing"))
+        }
+        _ => String::new(),
+    };
     let id = Uuid::new_v4().to_string();
     let edit_key = Uuid::new_v4().to_string();
     let created = now();
@@ -303,7 +408,7 @@ async fn create_trip(
     let emergency_phone = input.emergency_phone.unwrap_or_default();
     let new_edit_key = edit_key.clone();
     db(&state, move |conn| {
-        conn.execute("INSERT INTO trips (id,title,start_date,end_date,travelers,currency,origin,traveler_names,emergency_name,emergency_phone,edit_key,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12)", params![trip_id,title,start,end,travelers,currency,origin,traveler_names,emergency_name,emergency_phone,new_edit_key,created]).map_err(internal)?;
+        conn.execute("INSERT INTO trips (id,title,start_date,end_date,travelers,currency,origin,traveler_names,emergency_name,emergency_phone,edit_key,share_mode,pin_hash,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?14)", params![trip_id,title,start,end,travelers,currency,origin,traveler_names,emergency_name,emergency_phone,new_edit_key,share_mode,pin_hash,created]).map_err(internal)?;
         Ok(())
     }).await?;
     Ok((
@@ -315,21 +420,128 @@ async fn create_trip(
 async fn get_trip(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> ApiResult<Json<TripData>> {
+    let id_for_access = id.clone();
+    let (share_mode, pin_hash, edit_key, end_date): (String, String, String, String) =
+        db(&state, move |conn| {
+            conn.query_row(
+                "SELECT share_mode,pin_hash,edit_key,end_date FROM trips WHERE id=?1",
+                [&id_for_access],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(internal)?
+            .ok_or_else(not_found)
+        })
+        .await?;
+    let supplied_edit_key = headers
+        .get("x-edit-key")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let is_editor = !edit_key.is_empty() && supplied_edit_key == edit_key;
+    if share_mode == "public" && !is_editor && end_date < Utc::now().date_naive().to_string() {
+        return Err(not_found());
+    }
+    let supplied_pin = headers
+        .get("x-trip-pin")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if share_mode == "pin" && !is_editor {
+        if supplied_pin.is_empty() {
+            return Err(ApiError(
+                StatusCode::UNAUTHORIZED,
+                "Enter this trip's four-digit PIN".into(),
+            ));
+        }
+        let attempt_keys = pin_attempt_keys(&id, &headers);
+        let now_instant = Instant::now();
+        {
+            let mut attempts = state.pin_attempts.lock().await;
+            if attempts.blocked(&attempt_keys, now_instant) {
+                return Err(ApiError(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "Too many incorrect PIN attempts. Try again in 15 minutes.".into(),
+                ));
+            }
+        }
+        let pin = supplied_pin.to_owned();
+        let valid = tokio::task::spawn_blocking(move || verify_pin(&pin, &pin_hash))
+            .await
+            .map_err(internal)?;
+        if !valid {
+            state
+                .pin_attempts
+                .lock()
+                .await
+                .fail(&attempt_keys, now_instant);
+            return Err(ApiError(
+                StatusCode::UNAUTHORIZED,
+                "That PIN is incorrect".into(),
+            ));
+        }
+        state.pin_attempts.lock().await.clear(&attempt_keys);
+    }
+    let limited_view = !is_editor && matches!(share_mode.as_str(), "public" | "pin");
+    let access = if is_editor {
+        "editor"
+    } else if share_mode == "public" {
+        "public"
+    } else if share_mode == "pin" {
+        "pin"
+    } else {
+        "family"
+    }
+    .to_owned();
     db(&state, move |conn| {
-        let trip: Option<String> = conn.query_row("SELECT json_object('id',id,'title',title,'start_date',start_date,'end_date',end_date,'travelers',travelers,'currency',currency,'origin',origin,'traveler_names',traveler_names,'emergency_name',emergency_name,'emergency_phone',emergency_phone,'updated_at',updated_at) FROM trips WHERE id=?1", [&id], |r| r.get(0)).optional().map_err(internal)?;
+        let trip_sql = if limited_view {
+            "SELECT json_object('id',id,'title',title,'start_date',start_date,'end_date',end_date) FROM trips WHERE id=?1"
+        } else {
+            "SELECT json_object('id',id,'title',title,'start_date',start_date,'end_date',end_date,'travelers',travelers,'currency',currency,'origin',origin,'traveler_names',traveler_names,'emergency_name',emergency_name,'emergency_phone',emergency_phone,'share_mode',share_mode,'updated_at',updated_at) FROM trips WHERE id=?1"
+        };
+        let trip: Option<String> = conn.query_row(trip_sql, [&id], |r| r.get(0)).optional().map_err(internal)?;
         let trip = serde_json::from_str(&trip.ok_or_else(not_found)?).map_err(internal)?;
         let read_rows = |sql: &str| -> ApiResult<Vec<Value>> {
             let mut stmt = conn.prepare(sql).map_err(internal)?;
             let rows = stmt.query_map([&id], |r| r.get::<_, String>(0)).map_err(internal)?;
             rows.map(|r| r.map_err(internal).and_then(|s| serde_json::from_str(&s).map_err(internal))).collect()
         };
-        let items = read_rows("SELECT json_object('id',id,'day',day,'start_date',day,'end_date',COALESCE(end_day,day),'parent_id',parent_id,'kind',kind,'time',time,'title',title,'place',place,'category',category,'notes',notes,'cost',cost,'latitude',latitude,'longitude',longitude) FROM itinerary_items WHERE trip_id=?1 ORDER BY day,time,id")?;
-        let comments = read_rows("SELECT json_object('id',id,'name',name,'body',body,'created_at',created_at) FROM comments WHERE trip_id=?1 ORDER BY id DESC")?;
-        let expenses = read_rows("SELECT json_object('id',id,'description',description,'amount',amount,'category',category) FROM expenses WHERE trip_id=?1 ORDER BY id")?;
-        let photos = read_rows("SELECT json_object('id',id,'url','/photos/'||trip_id||'/'||filename,'caption',caption,'created_at',created_at) FROM photos WHERE trip_id=?1 ORDER BY id DESC")?;
-        Ok(Json(TripData { trip, items, comments, expenses, photos }))
+        let item_sql = if limited_view {
+            "SELECT json_object('id',id,'day',day,'start_date',day,'end_date',COALESCE(end_day,day),'parent_id',parent_id,'kind',kind,'time',time,'title',title,'place',place,'category',category,'latitude',latitude,'longitude',longitude) FROM itinerary_items WHERE trip_id=?1 ORDER BY day,time,id"
+        } else {
+            "SELECT json_object('id',id,'day',day,'start_date',day,'end_date',COALESCE(end_day,day),'parent_id',parent_id,'kind',kind,'time',time,'title',title,'place',place,'category',category,'notes',notes,'cost',cost,'latitude',latitude,'longitude',longitude) FROM itinerary_items WHERE trip_id=?1 ORDER BY day,time,id"
+        };
+        let items = read_rows(item_sql)?;
+        let (comments, expenses, photos) = if limited_view {
+            (Vec::new(), Vec::new(), Vec::new())
+        } else {
+            (
+                read_rows("SELECT json_object('id',id,'name',name,'body',body,'created_at',created_at) FROM comments WHERE trip_id=?1 ORDER BY id DESC")?,
+                read_rows("SELECT json_object('id',id,'description',description,'amount',amount,'category',category) FROM expenses WHERE trip_id=?1 ORDER BY id")?,
+                read_rows("SELECT json_object('id',id,'url','/photos/'||trip_id||'/'||filename,'caption',caption,'created_at',created_at) FROM photos WHERE trip_id=?1 ORDER BY id DESC")?,
+            )
+        };
+        Ok(Json(TripData { trip, items, comments, expenses, photos, access }))
     }).await
+}
+
+async fn public_trips(State(state): State<AppState>) -> ApiResult<Json<Vec<Value>>> {
+    let today = Utc::now().date_naive().to_string();
+    db(&state, move |conn| {
+        let mut statement = conn.prepare(
+            "SELECT json_object('id',id,'title',title,'start_date',start_date,'end_date',end_date) FROM trips WHERE share_mode='public' AND end_date>=?1 ORDER BY start_date,title",
+        ).map_err(internal)?;
+        let rows = statement
+            .query_map([today], |row| row.get::<_, String>(0))
+            .map_err(internal)?;
+        rows.map(|row| {
+            let json = row.map_err(internal)?;
+            serde_json::from_str(&json).map_err(internal)
+        })
+        .collect::<ApiResult<Vec<_>>>()
+    })
+    .await
+    .map(Json)
 }
 
 async fn update_trip(
@@ -339,11 +551,27 @@ async fn update_trip(
     Json(input): Json<UpdateTrip>,
 ) -> ApiResult<Json<Value>> {
     require_editor(&state, &id, &headers).await?;
+    if let Some(mode) = input.share_mode.as_deref() {
+        if !valid_share_mode(mode) {
+            return Err(bad("Sharing must be private, PIN protected, or public"));
+        }
+    }
     db(&state, move |conn| {
-        let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM trips WHERE id=?1)", [&id], |r| r.get(0)).map_err(internal)?;
-        if !exists { return Err(not_found()); }
+        let existing: Option<(String, String)> = conn.query_row("SELECT share_mode,pin_hash FROM trips WHERE id=?1", [&id], |row| Ok((row.get(0)?,row.get(1)?))).optional().map_err(internal)?;
+        let (existing_mode, existing_hash) = existing.ok_or_else(not_found)?;
         if let (Some(a), Some(b)) = (&input.start_date, &input.end_date) { if b < a { return Err(bad("End date must be on or after the start date")); } }
-        conn.execute("UPDATE trips SET title=COALESCE(?2,title),start_date=COALESCE(?3,start_date),end_date=COALESCE(?4,end_date),travelers=COALESCE(?5,travelers),currency=COALESCE(?6,currency),origin=COALESCE(?7,origin),traveler_names=COALESCE(?8,traveler_names),emergency_name=COALESCE(?9,emergency_name),emergency_phone=COALESCE(?10,emergency_phone),updated_at=?11 WHERE id=?1", params![id,input.title,input.start_date,input.end_date,input.travelers,input.currency,input.origin,input.traveler_names,input.emergency_name,input.emergency_phone,now()]).map_err(internal)?;
+        let share_mode = input.share_mode.unwrap_or(existing_mode.clone());
+        let pin_hash = if share_mode == "pin" {
+            match input.pin.as_deref().filter(|pin| !pin.is_empty()) {
+                Some(pin) if valid_pin(pin) => hash_pin(pin)?,
+                Some(_) => return Err(bad("PIN must be exactly four digits")),
+                None if existing_mode == "pin" && !existing_hash.is_empty() => existing_hash,
+                None => return Err(bad("Set a four-digit PIN for PIN-protected sharing")),
+            }
+        } else {
+            String::new()
+        };
+        conn.execute("UPDATE trips SET title=COALESCE(?2,title),start_date=COALESCE(?3,start_date),end_date=COALESCE(?4,end_date),travelers=COALESCE(?5,travelers),currency=COALESCE(?6,currency),origin=COALESCE(?7,origin),traveler_names=COALESCE(?8,traveler_names),emergency_name=COALESCE(?9,emergency_name),emergency_phone=COALESCE(?10,emergency_phone),share_mode=?11,pin_hash=?12,updated_at=?13 WHERE id=?1", params![id,input.title,input.start_date,input.end_date,input.travelers,input.currency,input.origin,input.traveler_names,input.emergency_name,input.emergency_phone,share_mode,pin_hash,now()]).map_err(internal)?;
         Ok(Json(json!({"ok":true})))
     }).await
 }
@@ -462,6 +690,26 @@ async fn add_comment(
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     if input.name.trim().is_empty() || input.body.trim().is_empty() {
         return Err(bad("Name and comment are required"));
+    }
+    let share_mode = db(&state, {
+        let trip_id = id.clone();
+        move |conn| {
+            conn.query_row(
+                "SELECT share_mode FROM trips WHERE id=?1",
+                [&trip_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(internal)?
+            .ok_or_else(not_found)
+        }
+    })
+    .await?;
+    if share_mode != "private" {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            "Comments are only available through the private family link".into(),
+        ));
     }
     db(&state, move |conn| {
         let count: i64 = conn
@@ -620,36 +868,37 @@ async fn search_places(
     *last = Some(Instant::now());
     drop(last);
 
-    let endpoint = state.geocoder_url.as_ref().clone();
-    let client = state.geocoder_client.clone();
-    let results = tokio::task::spawn_blocking(move || {
-        client
-            .get(endpoint)
-            .query(&[
-                ("q", search.as_str()),
-                ("format", "jsonv2"),
-                ("limit", "6"),
-                ("accept-language", "en"),
-                ("namedetails", "1"),
-            ])
-            .send()
-            .and_then(reqwest::blocking::Response::error_for_status)
-            .map_err(|e| {
-                ApiError(
-                    StatusCode::BAD_GATEWAY,
-                    format!("Place search is temporarily unavailable: {e}"),
-                )
-            })?
-            .json::<Vec<PlaceResult>>()
-            .map_err(|e| {
-                ApiError(
-                    StatusCode::BAD_GATEWAY,
-                    format!("Could not read place search results: {e}"),
-                )
-            })
-    })
-    .await
-    .map_err(internal)??;
+    let response = state
+        .geocoder_client
+        .get(state.geocoder_url.as_ref())
+        .query(&[
+            ("q", search.as_str()),
+            ("format", "jsonv2"),
+            ("limit", "6"),
+            ("accept-language", "en"),
+            ("namedetails", "1"),
+        ])
+        .send()
+        .await
+        .map_err(|e| {
+            ApiError(
+                StatusCode::BAD_GATEWAY,
+                format!("Place search is temporarily unavailable: {e}"),
+            )
+        })?
+        .error_for_status()
+        .map_err(|e| {
+            ApiError(
+                StatusCode::BAD_GATEWAY,
+                format!("Place search is temporarily unavailable: {e}"),
+            )
+        })?;
+    let results = response.json::<Vec<PlaceResult>>().await.map_err(|e| {
+        ApiError(
+            StatusCode::BAD_GATEWAY,
+            format!("Could not read place search results: {e}"),
+        )
+    })?;
     let results_json = serde_json::to_string(&results).map_err(internal)?;
     let insert_key = cache_key;
     let insert_results = results_json;
@@ -686,14 +935,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|_| "https://nominatim.openstreetmap.org/search".into()),
         ),
         geocoder_client: Arc::new(
-            reqwest::blocking::Client::builder()
+            reqwest::Client::builder()
                 .user_agent("WayfarerTripPlanner/0.1 (small group trip planner)")
                 .build()?,
         ),
+        pin_attempts: Arc::new(tokio::sync::Mutex::new(PinAttempts::default())),
     };
     let app = Router::new()
         .route("/", get(home))
         .route("/api/trips", post(create_trip))
+        .route("/api/public/trips", get(public_trips))
         .route("/api/trips/:id", get(get_trip).patch(update_trip))
         .route("/api/trips/:id/items", post(add_item))
         .route(
@@ -715,4 +966,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Trip planner ready at http://{address}");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{valid_pin, PinAttempts};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn pin_must_be_exactly_four_ascii_digits() {
+        assert!(valid_pin("0427"));
+        assert!(!valid_pin("427"));
+        assert!(!valid_pin("04270"));
+        assert!(!valid_pin("0４27"));
+        assert!(!valid_pin("abcd"));
+    }
+
+    #[test]
+    fn pin_attempt_limit_expires_after_fifteen_minutes() {
+        let mut attempts = PinAttempts::default();
+        let keys = vec![
+            "ip:192.0.2.1".to_owned(),
+            "browser:192.0.2.1:agent".to_owned(),
+        ];
+        let now = Instant::now();
+        for _ in 0..5 {
+            attempts.fail(&keys, now);
+        }
+        assert!(attempts.blocked(&keys, now));
+        assert!(!attempts.blocked(&keys, now + Duration::from_secs(15 * 60)));
+    }
 }

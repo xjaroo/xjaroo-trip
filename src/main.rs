@@ -162,7 +162,7 @@ async fn require_editor(state: &AppState, id: &str, headers: &HeaderMap) -> ApiR
     }
 }
 
-fn init_db(path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn init_db(path: &PathBuf) -> Result<usize, Box<dyn std::error::Error>> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
     }
@@ -241,14 +241,15 @@ fn init_db(path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             .collect::<Result<Vec<_>, _>>()?;
         rows
     };
+    let mut migrated_trips = 0;
     for trip_id in trips_without_pin {
         let pin_hash = hash_pin("2850").map_err(|error| std::io::Error::other(error.1))?;
-        conn.execute(
+        migrated_trips += conn.execute(
             "UPDATE trips SET share_mode='pin',pin_hash=?2 WHERE id=?1 AND pin_hash=''",
             params![trip_id, pin_hash],
         )?;
     }
-    Ok(())
+    Ok(migrated_trips)
 }
 
 fn ensure_column(
@@ -1036,6 +1037,17 @@ async fn map_config() -> Json<Value> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_path = PathBuf::from(env::var("TRIP_DB").unwrap_or_else(|_| "data/trips.sqlite".into()));
+    let mut arguments = env::args().skip(1);
+    if let Some(argument) = arguments.next() {
+        if argument == "--migrate-db" && arguments.next().is_none() {
+            let migrated_trips = init_db(&db_path)?;
+            println!(
+                "SQLite migration complete: assigned PIN 2850 to {migrated_trips} legacy trip(s) without a PIN. Existing PINs were kept."
+            );
+            return Ok(());
+        }
+        return Err(format!("Unknown command-line argument: {argument}").into());
+    }
     init_db(&db_path)?;
     let photo_path = db_path
         .parent()

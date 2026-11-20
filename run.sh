@@ -78,6 +78,25 @@ status() {
 }
 
 case "${1:-start}" in
+  migrate)
+    if [[ -n "$(listeners)" ]]; then
+      echo "A process is listening on port $port. Stop the trip planner before migrating its SQLite database." >&2
+      exit 1
+    fi
+    if ! command -v cargo >/dev/null 2>&1; then
+      echo "cargo is required to build the migration command." >&2
+      exit 1
+    fi
+    cargo build --release
+    if [[ -f "$TRIP_DB" ]]; then
+      backup_file="${TRIP_DB}.pre-pin-migration-$(date +%Y%m%d-%H%M%S).bak"
+      cp -p "$TRIP_DB" "$backup_file"
+      echo "SQLite backup: $backup_file"
+    else
+      echo "SQLite database does not exist yet; migration will initialize it: $TRIP_DB"
+    fi
+    "$binary" --migrate-db
+    ;;
   start|restart)
     if ! command -v cargo >/dev/null 2>&1; then
       echo "cargo is required to build the trip planner." >&2
@@ -119,7 +138,7 @@ case "${1:-start}" in
     status
     ;;
   *)
-    echo "Usage: $0 [start|stop|restart|status]" >&2
+    echo "Usage: $0 [start|stop|restart|status|migrate]" >&2
     exit 2
     ;;
 esac

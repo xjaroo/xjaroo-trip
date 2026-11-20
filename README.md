@@ -18,7 +18,10 @@ Manage the background app with:
 ./run.sh status
 ./run.sh restart
 ./run.sh stop
+./run.sh migrate
 ```
+
+`./run.sh migrate` applies the SQLite schema and legacy PIN migration without starting the web server. It refuses to run while a process is listening on the configured trip planner port and makes a timestamped copy of an existing database first. Trips with no PIN receive `2850`; trips that already have a PIN are left unchanged. Run it on the server with `.env` pointing `TRIP_DB` at the existing database, then start the updated application.
 
 Open the printed address and create a trip with its own four-digit PIN. Add stops with date ranges, then add optional daily activities inside each stop. The trip form records the travelers, their home base, and a contact back home. The dashboard highlights the stop covering today's date. Anyone with the trip link and PIN can view and edit the plan. Use **Copy trip** to start a fresh plan from stops and costs. Photos are resized in the browser to a maximum 1400 px edge and JPEG compressed before they are saved locally. **Save HTML** downloads a snapshot and **Save PDF** opens the browser print dialog.
 
